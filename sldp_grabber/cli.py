@@ -1,14 +1,12 @@
-# sldp_grabber/cli.py
 #!/usr/bin/env python3
 """
-Command-line interface for SLDP Grabber
+Command-line interface for SLDP Grabber.
 """
 
 import argparse
 import logging
 import shutil
 import sys
-from pathlib import Path
 
 from .grabber import SLDPGrabber
 from .utils import load_headers_from_file, parse_headers, parse_pipe_command
@@ -18,6 +16,7 @@ log = logging.getLogger("sldp_grabber")
 
 
 def main():
+    """Entry point for sldp-grabber CLI."""
     parser = argparse.ArgumentParser(
         description="Grab streams from SLDP WebSocket servers"
     )

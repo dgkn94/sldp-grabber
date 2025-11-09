@@ -1,5 +1,4 @@
-````markdown
-# sldp-grabber
+sldp-grabber
 
 A small tool and Python library to grab streams from **SLDP WebSocket** servers.
 
@@ -11,7 +10,7 @@ A small tool and Python library to grab streams from **SLDP WebSocket** servers.
 
 ---
 
-## Installation
+Installation
 
 From PyPI:
 
@@ -246,5 +245,3 @@ Key options:
   * H.264 + AAC → MP4
   * H.264 + (no AAC) + Opus sidecar → MKV + `.opus` kept
 * Designed to be simple to script against and easy to extend.
-
-```

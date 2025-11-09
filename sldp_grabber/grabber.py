@@ -1,3 +1,14 @@
+"""
+Core grabbing / recording logic for sldp-grabber.
+
+This module is intentionally large and pragmatic; some pylint checks are disabled.
+"""
+
+# pylint: disable=too-many-lines,too-many-instance-attributes,too-many-public-methods,
+# pylint: disable=too-few-public-methods,too-many-arguments,too-many-locals,
+# pylint: disable=too-many-branches,too-many-statements,too-many-return-statements,
+# pylint: disable=broad-exception-caught,attribute-defined-outside-init
+
 import csv
 import json
 import logging

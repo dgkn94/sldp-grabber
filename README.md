@@ -2,8 +2,8 @@ sldp-grabber
 
 >“SLDP is a trademark of Softvelum LLC. This project is not affiliated with or endorsed by Softvelum LLC.”
 
-- Connects to SLDP servers
-- Saves raw **H.264**, **AAC**, or **Opus**
+- Connects to SLDP-compatible WebSocket endpoints
+- Saves raw H.264, AAC, or Opus elementary streams
 - Optionally muxes into **MP4/MKV** using `ffmpeg`
 - Supports **segmenting**, **reconnects**, and **live piping** to tools like `ffplay`
 - Exposes a clean `SLDPGrabber` API for custom processing

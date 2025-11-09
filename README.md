@@ -1,5 +1,8 @@
 sldp-grabber
 
+>“SLDP is a trademark of Softvelum LLC. This project is not affiliated with or endorsed by Softvelum LLC.”
+
+
 A small tool and Python library to grab streams from **SLDP WebSocket** servers.
 
 - Connects to SLDP servers

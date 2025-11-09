@@ -8,7 +8,38 @@ A small tool and Python library to grab streams from **SLDP WebSocket** servers.
 - Supports **segmenting**, **reconnects**, and **live piping** to tools like `ffplay`
 - Exposes a clean `SLDPGrabber` API for custom processing
 
+
+> **Note**  
+> **SLDP (Softvelum Low Delay Protocol)** is designed, developed, and owned by **Softvelum LLC**.  
+> This project is an independent, unofficial helper tool for working with SLDP-compatible servers (such as Nimble Streamer).  
+> For official SLDP documentation and products, see: `https://softvelum.com/sldp`
+
 ---
+
+## What is SLDP? (Context)
+
+**SLDP (Softvelum Low Delay Protocol)** is a WebSocket-based protocol built for **low-latency live streaming**, typically targeting ~1s glass-to-glass delay or better.
+
+It is widely used for scenarios where latency matters:
+
+- Interactive streaming & real-time chats
+- Esports / gaming streams
+- Betting, auctions, and live trading
+- Security & surveillance
+- Second-screen / realtime companion feeds
+
+Key properties (as defined by Softvelum):
+
+- Runs over **WebSockets**
+- Designed for **low delay** playback
+- **Codec-agnostic**: H.264/H.265/AV1/VP8/VP9 video; AAC/MP3/Opus audio (depending on player/platform)
+- Supports ABR-style switching and synchronized playback
+- Supported via official players and SDKs (HTML5, Android, iOS, etc.)
+
+If you are new to SLDP, start with the official docs & players on the Softvelum website.
+
+---
+
 
 Installation
 

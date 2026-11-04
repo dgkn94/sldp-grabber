@@ -10,6 +10,8 @@ This module is intentionally large and pragmatic; some pylint checks are disable
 # pylint: disable=broad-exception-caught,attribute-defined-outside-init
 
 import csv
+import copy
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import shutil
@@ -106,7 +108,9 @@ class SLDPGrabber:
         self.url = url
         self.stream_name = stream_name
         self.out_dir = Path(out_dir)
-        self.out_dir.mkdir(exist_ok=True)  # make sure output dir exists
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        if duration < 0 or segment_duration < 0 or retry_delay < 0 or max_retries < 1:
+            raise ValueError("Durations and retry delay must be nonnegative; max_retries must be at least 1")
 
         self.pipe_video_started = False
         self.duration = duration  # 0 means run until stopped
@@ -127,6 +131,10 @@ class SLDPGrabber:
         self.ws: Optional[websocket.WebSocketApp] = None
         self.ws_connected: bool = False
         self.should_run: bool = True
+        self._callback_error = None
+        self._waiting_for_keyframe = True
+        self._mux_executor = None
+        self._mux_jobs = []
 
         # Track the streams we find
         self.video = StreamInfo(is_video=True)
@@ -145,6 +153,7 @@ class SLDPGrabber:
         self.aud_file: Optional[Path] = None
         self.video_writer = None
         self.audio_writer = None
+        self._created_files = set()
 
         # Piping to external commands (argv lists, no shell=True)
         self.pipe_h264_cmd = pipe_h264_cmd
@@ -176,7 +185,11 @@ class SLDPGrabber:
             "User-Agent": "Mozilla/5.0 (compatible; SLDP-Grabber/1.0)",
         }
         if headers:
-            self.ws_headers.update(headers)
+            for key, value in headers.items():
+                for existing in list(self.ws_headers):
+                    if existing.lower() == key.lower():
+                        del self.ws_headers[existing]
+                self.ws_headers[key] = value
 
     # ---------- WebSocket callbacks ----------
 
@@ -198,10 +211,15 @@ class SLDPGrabber:
         if not self.should_run:
             return
 
-        if isinstance(message, str):
-            self.handle_text_message(message)
-        else:
-            self.handle_binary_message(message)
+        try:
+            if isinstance(message, str):
+                self.handle_text_message(message)
+            else:
+                self.handle_binary_message(message)
+        except Exception as exc:
+            self._callback_error = exc
+            self.should_run = False
+            ws.close()
 
     # ---------- Text messages ----------
 
@@ -212,7 +230,7 @@ class SLDPGrabber:
             log.warning("Got weird JSON from server, skipping")
             return
 
-        if data.get("command") != "status":
+        if not isinstance(data, dict) or data.get("command") != "status":
             return
 
         if self.list_only:
@@ -241,6 +259,10 @@ class SLDPGrabber:
             log.info("  %s: %s", name, details)
 
     def parse_stream_info(self, data: dict):
+        self.video.stream_name = None
+        self.audio.stream_name = None
+        self.audio_is_aac = False
+        self.audio_is_opus = False
         streams = data.get("info", [])
         if not streams:
             log.warning("No stream info in server message")
@@ -256,7 +278,9 @@ class SLDPGrabber:
                 log.error(msg)
                 return
         else:
-            filtered = streams
+            # Keep audio and video on the same rendition.
+            self.stream_name = streams[0].get("stream")
+            filtered = [s for s in streams if s.get("stream") == self.stream_name]
 
         for stream in filtered:
             info = stream.get("stream_info", {}) or {}
@@ -286,6 +310,8 @@ class SLDPGrabber:
                         self.video.timescale,
                     )
                 else:
+                    if self.strict:
+                        raise RuntimeError(f"Strict mode: unsupported video codec {self.video.codec}")
                     log.warning("Video codec %s not supported - skipping video", self.video.codec)
                     self.video.stream_name = None
                     self.video.codec = None
@@ -312,6 +338,8 @@ class SLDPGrabber:
                         self.audio.timescale,
                     )
                 else:
+                    if self.strict:
+                        raise RuntimeError(f"Strict mode: unsupported audio codec {self.audio.codec}")
                     log.warning("Audio codec %s not supported - skipping audio", self.audio.codec)
                     self.audio.stream_name = None
                     self.audio_is_aac = False
@@ -323,17 +351,6 @@ class SLDPGrabber:
                 self.stream_name = self.video.stream_name
             elif self.audio.stream_name:
                 self.stream_name = self.audio.stream_name
-
-        # Strict validation
-        if self.strict:
-            if self.video.stream_name:
-                vc = (self.video.codec or "").lower()
-                if not (vc.startswith("avc1.") or "h264" in vc or "avc" in vc):
-                    raise RuntimeError(f"Strict mode: unsupported video codec {self.video.codec}")
-            if self.audio.stream_name:
-                ac = (self.audio.codec or "").lower()
-                if not (ac.startswith("mp4a.") or "opus" in ac):
-                    raise RuntimeError(f"Strict mode: unsupported audio codec {self.audio.codec}")
 
     def request_streams(self):
         streams_to_play = []
@@ -364,22 +381,34 @@ class SLDPGrabber:
                 # Single-file mode: open writers
                 if self.video.stream_name and not self.video_writer:
                     if not self.h264_file:
-                        self.h264_file = self.out_dir / "video.h264"
+                        self.h264_file = self._available_path(self.out_dir / "video.h264")
                     self._open_video_writer(self.h264_file)
 
                 if self.audio.stream_name and not self.audio_writer:
                     if not self.aud_file:
-                        self.aud_file = self.out_dir / f"audio.{self.audio_ext}"
+                        self.aud_file = self._available_path(self.out_dir / f"audio.{self.audio_ext}")
                     self._open_audio_writer(self.aud_file)
 
                 # Start pipes in non-segment mode too
-                self.h264_pipe = self._start_pipe(self.pipe_h264_cmd, "H.264")
-                self.aac_pipe = self._start_pipe(self.pipe_aac_cmd, "audio")
+                if self.h264_pipe is None:
+                    self.h264_pipe = self._start_pipe(self.pipe_h264_cmd, "H.264")
+                if self.aac_pipe is None:
+                    self.aac_pipe = self._start_pipe(self.pipe_aac_cmd, "audio")
 
         except Exception as e:
             log.error("Failed to send Play command: %s", e)
+            raise
 
     # ---------- Pipes and file helpers ----------   
+
+    @staticmethod
+    def _available_path(path: Path) -> Path:
+        candidate = path
+        index = 1
+        while candidate.exists():
+            candidate = path.with_name(f"{path.stem}({index}){path.suffix}")
+            index += 1
+        return candidate
 
     def _start_pipe(self, cmd: List[str], label: str) -> Optional[subprocess.Popen]:
         """Safely start a pipe command with error handling."""
@@ -406,6 +435,7 @@ class SLDPGrabber:
         except subprocess.TimeoutExpired:
             log.warning("%s pipe didn't exit cleanly, killing it", label)
             proc.kill()
+            proc.wait()
         except Exception as e:
             log.warning("Error waiting for %s pipe: %s", label, e)
         else:
@@ -415,18 +445,22 @@ class SLDPGrabber:
     def _open_video_writer(self, path: Path):
         self.close_video_writer()
         try:
-            self.video_writer = open(path, "wb")
+            self.video_writer = open(path, "xb")
+            self._created_files.add(path)
         except OSError as e:
             log.error("Failed to open video file %s: %s", path, e)
             self.video_writer = None
+            raise
 
     def _open_audio_writer(self, path: Path):
         self.close_audio_writer()
         try:
-            self.audio_writer = open(path, "wb")
+            self.audio_writer = open(path, "xb")
+            self._created_files.add(path)
         except OSError as e:
             log.error("Failed to open audio file %s: %s", path, e)
             self.audio_writer = None
+            raise
 
     def close_video_writer(self):
         if self.video_writer:
@@ -450,7 +484,11 @@ class SLDPGrabber:
         else:
             self.segment_index += 1
 
-        self.segment_start_wall = time.time()
+        while any((self.out_dir / f"segment_{self.segment_index:04d}.{ext}").exists()
+                  for ext in ("h264", "aac", "opus", "mp4", "mkv")):
+            self.segment_index += 1
+
+        self.segment_start_wall = time.monotonic()
 
         base = f"segment_{self.segment_index:04d}"
         self.h264_file = self.out_dir / f"{base}.h264"
@@ -464,17 +502,23 @@ class SLDPGrabber:
         self.video_frames = 0
         self.audio_frames = 0
         self.video.sps_pps_written = False
+        self.video.frame_count = 0
+        self.video.first_ts = None
+        self.video.last_ts = None
+        self._waiting_for_keyframe = True
         self.pipe_video_started = False
 
         # Restart pipes using argv list
         self.h264_pipe = self._start_pipe(self.pipe_h264_cmd, "H.264")
         self.aac_pipe = self._start_pipe(self.pipe_aac_cmd, "audio")
 
-    def check_segment_rollover(self):
-        if self.segment_duration <= 0 or not self.segment_start_wall:
+    def check_segment_rollover(self, is_keyframe: bool = False):
+        if self.segment_duration <= 0 or self.segment_start_wall is None:
             return
 
-        if time.time() - self.segment_start_wall < self.segment_duration:
+        if self.video.stream_name and not is_keyframe:
+            return
+        if time.monotonic() - self.segment_start_wall < self.segment_duration:
             return
 
         self.finish_current_segment(create_mp4=self.segment_create_mp4)
@@ -489,25 +533,39 @@ class SLDPGrabber:
         self.close_video_writer()
         self.close_audio_writer()
 
+        # Mux closed files on one worker; receiving the next segment can continue.
+        if create_mp4:
+            if self._mux_executor is None:
+                self._mux_executor = ThreadPoolExecutor(max_workers=1)
+            segment = copy.copy(self)
+            segment.video = copy.copy(self.video)
+            self._mux_jobs.append(self._mux_executor.submit(segment._finish_segment_outputs, True))
+        else:
+            self._finish_segment_outputs(False)
+
+    def _finish_segment_outputs(self, create_mp4: bool):
+
         if not self.h264_file and not self.aud_file:
             return
 
         has_video = (
             self.h264_file
+            and self.h264_file in self._created_files
             and self.h264_file.exists()
             and self.h264_file.stat().st_size > 0
         )
         has_audio = (
             self.aud_file
+            and self.aud_file in self._created_files
             and self.aud_file.exists()
             and self.aud_file.stat().st_size > 0
         )
 
         if not has_video and not has_audio:
-            if self.h264_file and self.h264_file.exists():
-                self.h264_file.unlink(missing_ok=True)
-            if self.aud_file and self.aud_file.exists():
-                self.aud_file.unlink(missing_ok=True)
+            if self.h264_file in self._created_files and self.h264_file.exists():
+                self.h264_file.unlink()
+            if self.aud_file in self._created_files and self.aud_file.exists():
+                self.aud_file.unlink()
             return
 
         if create_mp4:
@@ -519,10 +577,10 @@ class SLDPGrabber:
             )
             if out is not None and not self.keep_raw:
                 if has_video and self.h264_file and self.h264_file.exists():
-                    self.h264_file.unlink(missing_ok=True)
+                    self.h264_file.unlink()
                 if has_audio and self.aud_file and self.aud_file.exists():
                     if self.audio_is_aac:
-                        self.aud_file.unlink(missing_ok=True)
+                        self.aud_file.unlink()
                     else:
                         log.info(
                             "Keeping %s (can't mux this audio format to MP4)",
@@ -546,6 +604,7 @@ class SLDPGrabber:
                 pos += 8
             else:
                 log.debug("Frame missing timestamp (len=%d)", len(data))
+                return
 
         cto = None
         if frame_type in (self.AVC_KEYFRAME, self.AVC_FRAME):
@@ -554,6 +613,7 @@ class SLDPGrabber:
                 pos += 4
             else:
                 log.debug("Video frame missing CTO")
+                return
 
         payload = data[pos:]
 
@@ -582,15 +642,22 @@ class SLDPGrabber:
                 log.warning("Failed to parse video config: %s", e)
             return
 
+        if frame_type not in (self.AVC_KEYFRAME, self.AVC_FRAME):
+            return
         if not self.video.extradata or not data:
             return
         if not self.video_writer and not self.h264_pipe:
             return
 
         is_keyframe = (frame_type == self.AVC_KEYFRAME)
+        if self._waiting_for_keyframe and not is_keyframe:
+            return
         annexb = self.convert_to_annexb(data, self.video.nalu_length_size)
         if not annexb:
             return
+
+        self.check_segment_rollover(is_keyframe=is_keyframe)
+        self._waiting_for_keyframe = False
 
         if self.video.sps_pps_data and (is_keyframe or not self.video.sps_pps_written):
             if self.video_writer:
@@ -630,9 +697,10 @@ class SLDPGrabber:
         if self.on_video_frame:
             meta = {"timestamp": timestamp, "cto": cto, "keyframe": is_keyframe}
             try:
-                self.on_video_frame(annexb, meta)
+                frame = (self.video.sps_pps_data or b"") + annexb if is_keyframe else annexb
+                self.on_video_frame(frame, meta)
             except Exception:
-                pass
+                log.exception("Video frame callback failed")
 
         self.video_frames += 1
 
@@ -640,8 +708,6 @@ class SLDPGrabber:
             self.ts_rows.append(
                 ["video", frame_type, timestamp, cto if cto is not None else ""]
             )
-
-        self.check_segment_rollover()
 
     def process_audio_frame(self, frame_type: int, timestamp, data: bytes):
         # AAC
@@ -661,6 +727,10 @@ class SLDPGrabber:
             if not self.audio_writer and not self.aac_pipe:
                 return
 
+            if self.video.stream_name and self._waiting_for_keyframe:
+                return
+            self.check_segment_rollover()
+
             adts = self.make_adts_header(len(data), self.aac_rate, self.aac_channels)
             frame = adts + data
 
@@ -678,14 +748,13 @@ class SLDPGrabber:
                 try:
                     self.on_audio_frame(frame, meta)
                 except Exception:
-                    pass
+                    log.exception("Audio frame callback failed")
 
             self.audio_frames += 1
 
             if self.debug_ts and timestamp is not None:
                 self.ts_rows.append(["audio", frame_type, timestamp, ""])
 
-            self.check_segment_rollover()
             return
 
         # Opus (raw packets)
@@ -701,6 +770,10 @@ class SLDPGrabber:
             if not self.audio_writer and not self.aac_pipe:
                 return
 
+            if self.video.stream_name and self._waiting_for_keyframe:
+                return
+            self.check_segment_rollover()
+
             if self.audio_writer:
                 self.audio_writer.write(data)
             if self.aac_pipe and self.aac_pipe.stdin:
@@ -715,14 +788,13 @@ class SLDPGrabber:
                 try:
                     self.on_audio_frame(data, meta)
                 except Exception:
-                    pass
+                    log.exception("Audio frame callback failed")
 
             self.audio_frames += 1
 
             if self.debug_ts and timestamp is not None:
                 self.ts_rows.append(["audio-opus", frame_type, timestamp, ""])
 
-            self.check_segment_rollover()
             return
 
     # ---------- Static helpers ----------
@@ -742,6 +814,8 @@ class SLDPGrabber:
             # SPS
             sps_count = avcc_data[pos] & 0x1F
             pos += 1
+            if not sps_count:
+                return b""
             for _ in range(sps_count):
                 if pos + 2 > len(avcc_data):
                     return b""
@@ -754,18 +828,20 @@ class SLDPGrabber:
                 pos += sps_len
 
             if pos >= len(avcc_data):
-                return bytes(out)
+                return b""
 
             # PPS
             pps_count = avcc_data[pos]
             pos += 1
+            if not pps_count:
+                return b""
             for _ in range(pps_count):
                 if pos + 2 > len(avcc_data):
-                    break
+                    return b""
                 pps_len = (avcc_data[pos] << 8) | avcc_data[pos + 1]
                 pos += 2
                 if pps_len <= 0 or pos + pps_len > len(avcc_data):
-                    break
+                    return b""
                 out.extend(b"\x00\x00\x00\x01")
                 out.extend(avcc_data[pos:pos + pps_len])
                 pos += pps_len
@@ -790,13 +866,13 @@ class SLDPGrabber:
             pos += nalu_size
 
             if nalu_len <= 0 or pos + nalu_len > total_len:
-                break
+                return b""
 
             out.extend(b"\x00\x00\x00\x01")
             out.extend(data[pos:pos + nalu_len])
             pos += nalu_len
 
-        return bytes(out)
+        return bytes(out) if pos == total_len else b""
 
     @staticmethod
     def parse_audio_config(asc_data: bytes):
@@ -823,9 +899,6 @@ class SLDPGrabber:
         if channels <= 0:
             log.warning("Channel config 0, assuming stereo")
             channels = 2
-        if channels == 7:
-            channels = 8
-
         return rate, channels
 
     @staticmethod
@@ -878,7 +951,7 @@ class SLDPGrabber:
         if duration <= 0:
             return None
 
-        fps = fc / duration
+        fps = (fc - 1) / duration
         if fps < 1 or fps > 120:
             return None
 
@@ -896,13 +969,13 @@ class SLDPGrabber:
         ) or "recording"
 
         candidate = self.out_dir / f"{safe_name}.mp4"
-        if not candidate.exists():
+        if not candidate.exists() and not candidate.with_suffix(".mkv").exists():
             return candidate
 
         i = 1
         while True:
             candidate = self.out_dir / f"{safe_name}({i}).mp4"
-            if not candidate.exists():
+            if not candidate.exists() and not candidate.with_suffix(".mkv").exists():
                 return candidate
             i += 1
 
@@ -927,7 +1000,7 @@ class SLDPGrabber:
             return None
 
         if self.audio_is_aac and audio_input:
-            out_path = output_base.with_suffix(".mp4")
+            out_path = Path(str(output_base) + ".mp4")
         elif self.audio_is_opus:
             if audio_input:
                 log.warning(
@@ -935,15 +1008,15 @@ class SLDPGrabber:
                     audio_input,
                 )
             if video_input:
-                out_path = output_base.with_suffix(".mkv")
+                out_path = Path(str(output_base) + ".mkv")
                 audio_input = None
             else:
                 log.info("Audio-only Opus - no container created")
                 return None
         else:
-            out_path = output_base.with_suffix(".mp4")
+            out_path = Path(str(output_base) + ".mp4")
 
-        cmd = ["ffmpeg", "-y", "-hide_banner"]
+        cmd = ["ffmpeg", "-n", "-hide_banner", "-nostdin"]
 
         fps = self.estimate_fps(self.video) if video_input else None
         if video_input:
@@ -973,7 +1046,7 @@ class SLDPGrabber:
         if not start_time:
             return
 
-        now = time.time()
+        now = time.monotonic()
         last = getattr(self, "_last_progress", 0.0)
         if now - last < 1.0:
             return
@@ -1011,26 +1084,19 @@ class SLDPGrabber:
             self.close_video_writer()
             self.close_audio_writer()
 
-            h264 = self.h264_file or (self.out_dir / "video.h264")
-            audio = self.aud_file
+            h264 = self.h264_file if self.h264_file in self._created_files else None
+            audio = self.aud_file if self.aud_file in self._created_files else None
 
-            if (not audio) or (audio and not audio.exists()):
-                for ext in ("aac", "opus"):
-                    cand = self.out_dir / f"audio.{ext}"
-                    if cand.exists():
-                        audio = cand
-                        break
-
-            if h264.exists():
+            if h264 and h264.exists():
                 if self.video_frames == 0 or h264.stat().st_size == 0:
-                    h264.unlink(missing_ok=True)
+                    h264.unlink()
                     log.debug("Removed empty %s", h264.name)
                 else:
                     log.info("Saved %s (%d video frames)", h264.name, self.video_frames)
 
             if audio and audio.exists():
                 if self.audio_frames == 0 or audio.stat().st_size == 0:
-                    audio.unlink(missing_ok=True)
+                    audio.unlink()
                     log.debug("Removed empty %s", audio.name)
                 else:
                     log.info("Saved %s (%d audio frames)", audio.name, self.audio_frames)
@@ -1039,21 +1105,28 @@ class SLDPGrabber:
                 mp4_path = self.make_output_mp4_path(mp4_base)
                 base = mp4_path.with_suffix("")
                 out = self.mux_to_container(
-                    h264 if h264.exists() else None,
+                    h264 if h264 and h264.exists() else None,
                     audio if (audio and audio.exists()) else None,
                     base,
                 )
                 if out is not None and not self.keep_raw:
-                    if h264.exists():
-                        h264.unlink(missing_ok=True)
+                    if h264 and h264.exists():
+                        h264.unlink()
                     if audio and audio.exists():
                         if self.audio_is_aac:
-                            audio.unlink(missing_ok=True)
+                            audio.unlink()
                         else:
                             log.info("Keeping %s (raw audio)", audio.name)
 
+        if self._mux_executor is not None:
+            self._mux_executor.shutdown(wait=True)
+            self._mux_executor = None
+            for job in self._mux_jobs:
+                job.result()
+            self._mux_jobs.clear()
+
         if self.debug_ts and self.ts_rows:
-            ts_path = self.out_dir / "timestamps.csv"
+            ts_path = self._available_path(self.out_dir / "timestamps.csv")
             try:
                 with ts_path.open("w", newline="") as f:
                     w = csv.writer(f)
@@ -1070,116 +1143,85 @@ class SLDPGrabber:
                    
 
     def run(self, create_mp4: bool = True, mp4_base: Optional[str] = None):
-        global_start = time.time()
-        start_time = global_start if self.duration > 0 else None
-        attempt = 0
-        remaining = self.duration if self.duration > 0 else None
+        global_start = time.monotonic()
+        deadline = global_start + self.duration if self.duration > 0 else None
         self.segment_create_mp4 = create_mp4
+        ws_thread = None
 
-        while self.should_run:
-            if remaining is not None and remaining <= 0:
-                break
-            if start_time is not None and (time.time() - start_time) >= self.duration:
-                log.info("Time's up!")
-                self.should_run = False
-                break
-
-            attempt += 1
-            if attempt > 1 and not self.list_only:
-                log.info("Trying to reconnect (attempt %d)", attempt)
-
-            header_list = [f"{k}: {v}" for k, v in self.ws_headers.items()]
-            safe_headers = [
-                f"{k}: {hide_sensitive_headers(k, v)}"
-                for k, v in self.ws_headers.items()
-            ]
-            log.debug("Using headers: %s", "; ".join(safe_headers))
-
-            self.ws_connected = False
-            self.ws = websocket.WebSocketApp(
-                self.url,
-                header=header_list,
-                on_open=self.ws_on_open,
-                on_message=self.ws_on_message,
-                on_error=self.ws_on_error,
-                on_close=self.ws_on_close,
-            )
-
-            ws_thread = threading.Thread(target=self.ws.run_forever, daemon=True)
-            ws_thread.start()
-
-            time.sleep(2.0)
-            if not self.ws_connected:
-                try:
-                    self.ws.close()
-                except Exception:
-                    pass
-                ws_thread.join(timeout=2.0)
-
-                if self.list_only:
-                    self.should_run = False
+        try:
+            for attempt in range(1, self.max_retries + 1):
+                if not self.should_run or (deadline is not None and time.monotonic() >= deadline):
                     break
-                if attempt >= self.max_retries:
-                    log.error("Giving up after %d attempts", self.max_retries)
-                    self.should_run = False
+                if attempt > 1:
+                    log.info("Trying to reconnect (attempt %d)", attempt)
+
+                # Let websocket-client generate exactly one Origin and subprotocol header.
+                headers = dict(self.ws_headers)
+                origin = next((headers.pop(k) for k in list(headers) if k.lower() == "origin"), None)
+                protocol = next((headers.pop(k) for k in list(headers)
+                                 if k.lower() == "sec-websocket-protocol"), "sldp.softvelum.com")
+                log.debug("Using headers: %s", "; ".join(
+                    f"{k}: {hide_sensitive_headers(k, v)}" for k, v in headers.items()))
+                self.ws_connected = False
+                self._waiting_for_keyframe = True
+                self.video.sps_pps_written = False
+                self.pipe_video_started = False
+                self.ws = websocket.WebSocketApp(
+                    self.url,
+                    header=[f"{k}: {v}" for k, v in headers.items()],
+                    subprotocols=[p.strip() for p in protocol.split(",")],
+                    on_open=self.ws_on_open,
+                    on_message=self.ws_on_message,
+                    on_error=self.ws_on_error,
+                    on_close=self.ws_on_close,
+                )
+                ws_thread = threading.Thread(
+                    target=self.ws.run_forever, kwargs={"origin": origin}, daemon=True)
+                ws_thread.start()
+                connect_deadline = time.monotonic() + 10.0
+                list_deadline = None
+                connected = False
+                while self.should_run and ws_thread.is_alive():
+                    now = time.monotonic()
+                    if deadline is not None and now >= deadline:
+                        self.should_run = False
+                        break
+                    if self.ws_connected:
+                        connected = True
+                        if self.list_only and list_deadline is None:
+                            list_deadline = now + 3.0
+                        if not self.list_only:
+                            self._print_progress(global_start, self.duration or None)
+                    elif not connected and now >= connect_deadline:
+                        log.error("Connection timed out")
+                        break
+                    if list_deadline is not None and now >= list_deadline:
+                        self.should_run = False
+                        break
+                    time.sleep(0.05)
+
+                self.ws.close()
+                ws_thread.join()
+                ws_thread = None
+                if self._callback_error is not None:
+                    raise self._callback_error
+                if not self.should_run or self.list_only:
                     break
+                if attempt == self.max_retries:
+                    raise RuntimeError(f"Connection ended after {self.max_retries} attempts")
 
-                time.sleep(self.retry_delay)
-                continue
-
-            if self.list_only:
-                wait_start = time.time()
-                while (
-                    self.should_run
-                    and self.ws_connected
-                    and time.time() - wait_start < 3.0
-                ):
-                    time.sleep(0.1)
-                self.should_run = False
-                try:
-                    self.ws.close()
-                except Exception:
-                    pass
-                ws_thread.join(timeout=2.0)
-                break
-
-            try:
-                if remaining is not None:
-                    loop_start = time.time()
-                    while self.should_run and self.ws_connected:
-                        if time.time() - loop_start >= remaining:
-                            log.info("Recording time complete")
-                            self.should_run = False
-                            break
-                        self._print_progress(global_start, self.duration)
-                        time.sleep(0.25)
-                    if remaining is not None:
-                        used = max(0.0, time.time() - loop_start)
-                        remaining = max(0.0, remaining - used)
-                else:
-                    log.info("Recording - press Ctrl+C to stop")
-                    while self.should_run and self.ws_connected:
-                        self._print_progress(global_start, None)
-                        time.sleep(0.25)
-            except KeyboardInterrupt:
-                log.info("Stopping...")
-                self.should_run = False
-            finally:
-                try:
-                    self.ws.close()
-                except Exception:
-                    pass
-                ws_thread.join(timeout=2.0)
-
-            if not self.should_run:
-                break
-            if remaining is not None and remaining <= 0:
-                break
-            if attempt >= self.max_retries:
-                log.error("Too many retries, stopping")
-                self.should_run = False
-                break
-
-            time.sleep(self.retry_delay)
-
-        self.finalize(create_mp4=create_mp4, mp4_base=mp4_base)
+                retry_end = time.monotonic() + self.retry_delay
+                while self.should_run and time.monotonic() < retry_end:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        self.should_run = False
+                        break
+                    time.sleep(0.05)
+        except KeyboardInterrupt:
+            log.info("Stopping...")
+        finally:
+            self.should_run = False
+            if self.ws is not None:
+                self.ws.close()
+            if ws_thread is not None and ws_thread.ident is not None:
+                ws_thread.join()
+            self.finalize(create_mp4=create_mp4, mp4_base=mp4_base)

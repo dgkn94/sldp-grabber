@@ -42,3 +42,4 @@ sldp-grabber = "sldp_grabber.cli:main"
 
 [tool.setuptools]
 packages = ["sldp_grabber"]
+license-files = ["LICENCE"]

@@ -47,7 +47,7 @@ From PyPI:
 
 ```bash
 pip install sldp-grabber
-````
+```
 
 From source:
 
@@ -100,7 +100,11 @@ sldp-grabber \
   --segment-duration 300
 ```
 
-Each segment becomes its own raw/set of files and (optionally) MP4/MKV.
+Each segment becomes its own set of raw files and (optionally) MP4/MKV.
+Video segments start at a keyframe, so their duration can exceed the requested
+interval by up to the next keyframe. Completed segments mux in the background;
+the grabber waits for pending mux jobs before exiting. Existing recordings are
+preserved: raw files receive a numeric suffix and existing segment numbers are skipped.
 
 ---
 
@@ -271,8 +275,34 @@ Key options:
 
 * Video is handled as H.264 (Annex B) when supported.
 * Audio is handled as AAC (ADTS) or raw Opus packets.
+* Automatic stream selection uses the first advertised stream. Use `--stream`
+  to select a specific rendition; audio and video are selected from the same stream.
+* `--duration` measures total elapsed time, including connection attempts and retry delays.
+* `--max-retries` limits total connection attempts, including the initial attempt.
+* MP4/MKV video timing is reconstructed from average frame rate. Original frame
+  timestamps, composition offsets, reconnect gaps, and variable frame timing are
+  not preserved, so exact A/V synchronization is not guaranteed.
+* Opus sidecars contain concatenated raw packets, not an Ogg Opus file. They are
+  not directly playable; use the audio callback to preserve packet boundaries
+  for custom processing.
+* Video callbacks receive SPS/PPS before keyframes, allowing a decoder to
+  initialize from callback data. Callback exceptions are logged.
+* Pipe writes and callbacks run on the receiving thread. Slow consumers can
+  delay recording; callbacks should return promptly.
 * Muxing:
 
   * H.264 + AAC → MP4
   * H.264 + (no AAC) + Opus sidecar → MKV + `.opus` kept
 * Designed to be simple to script against and easy to extend.
+
+## Development
+
+Run the regression tests with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The media integration test generates H.264 footage, records segments, and verifies
+that every segment decodes independently. It requires `ffmpeg` (with `libx264`)
+and `ffprobe`; it is skipped when these tools are unavailable.

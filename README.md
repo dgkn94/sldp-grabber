@@ -297,6 +297,8 @@ Key options:
 
 ## Development
 
+This project is licensed under GNU GPL version 3. See [LICENCE](LICENCE).
+
 Run the regression tests with:
 
 ```bash

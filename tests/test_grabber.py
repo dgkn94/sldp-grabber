@@ -202,8 +202,8 @@ class RunTests(unittest.TestCase):
                 self.request.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
                                       "Connection: Upgrade\r\nSec-WebSocket-Protocol: sldp.softvelum.com\r\n"
                                       f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode())
-                self.request.recv(4096)
-                self.request.sendall(b"\x88\x00")
+                if self.request.recv(4096):
+                    self.request.sendall(b"\x88\x00")
 
         with socketserver.TCPServer(("127.0.0.1", 0), Handler) as server, \
              tempfile.TemporaryDirectory() as root:

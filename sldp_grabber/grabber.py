@@ -1069,6 +1069,19 @@ class SLDPGrabber:
 
     # ---------- Finalization & run loop ----------
 
+    def _close_websocket(self):
+        if self.ws is None:
+            return
+        self.ws.keep_running = False
+        sock = self.ws.sock
+        if sock is not None:
+            try:
+                # Wake the receive thread before closing its socket on another thread.
+                sock.abort()
+            except OSError:
+                pass
+        self.ws.close(timeout=0)
+
     def finalize(self, create_mp4: bool, mp4_base: Optional[str]):
         if self.list_only:
             return
@@ -1200,7 +1213,7 @@ class SLDPGrabber:
                         break
                     time.sleep(0.05)
 
-                self.ws.close()
+                self._close_websocket()
                 ws_thread.join()
                 ws_thread = None
                 if self._callback_error is not None:
@@ -1220,8 +1233,7 @@ class SLDPGrabber:
             log.info("Stopping...")
         finally:
             self.should_run = False
-            if self.ws is not None:
-                self.ws.close()
+            self._close_websocket()
             if ws_thread is not None and ws_thread.ident is not None:
                 ws_thread.join()
             self.finalize(create_mp4=create_mp4, mp4_base=mp4_base)

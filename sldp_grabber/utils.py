@@ -24,7 +24,6 @@ def load_headers_from_file(path: Optional[str]) -> Dict[str, str]:
         if not line or line.startswith("#") or ":" not in line:
             continue
         k, v = line.split(":", 1)
-        headers[k].strip()
         headers[k.strip()] = v.strip()
     return headers
 

@@ -14,6 +14,8 @@ version = version_match.group(1) if version_match else "1.0.0"
 setup(
     name="sldp-grabber",
     version=version,
+    license="GPL-3.0-only",
+    license_files=["LICENCE"],
     author="SLDP Grabber",
     description="A small tool and library to grab SLDP WebSocket streams and save/mux them.",
     long_description=README,

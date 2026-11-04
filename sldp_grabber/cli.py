@@ -74,7 +74,7 @@ def main():
         "--max-retries",
         type=int,
         default=3,
-        help="How many times to retry connection",
+        help="Maximum total connection attempts (including the initial attempt)",
     )
     connect.add_argument(
         "--retry-delay",
@@ -131,6 +131,10 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.duration < 0 or args.segment_duration < 0 or args.retry_delay < 0:
+        parser.error("durations and retry delay must be nonnegative")
+    if args.max_retries < 1:
+        parser.error("--max-retries must be at least 1")
 
     # Configure logging once for the CLI
     logging.basicConfig(
@@ -176,7 +180,10 @@ def main():
         keep_raw=args.keep_raw,
     )
 
-    grabber.run(create_mp4=create_container, mp4_base=args.output)
+    try:
+        grabber.run(create_mp4=create_container, mp4_base=args.output)
+    except (OSError, RuntimeError, ValueError) as exc:
+        parser.exit(1, f"ERROR: {exc}\n")
 
 
 if __name__ == "__main__":
